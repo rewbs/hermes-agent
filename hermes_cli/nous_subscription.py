@@ -63,6 +63,10 @@ class NousSubscriptionFeatures:
         return self.features["image_gen"]
 
     @property
+    def video_gen(self) -> NousFeatureState:
+        return self.features["video_gen"]
+
+    @property
     def tts(self) -> NousFeatureState:
         return self.features["tts"]
 
@@ -75,9 +79,11 @@ class NousSubscriptionFeatures:
         return self.features["modal"]
 
     def items(self) -> Iterable[NousFeatureState]:
-        ordered = ("web", "image_gen", "tts", "browser", "modal")
+        ordered = ("web", "image_gen", "video_gen", "tts", "browser", "modal")
         for key in ordered:
-            yield self.features[key]
+            feature = self.features.get(key)
+            if feature is not None:
+                yield feature
 
 
 def _model_config_dict(config: Dict[str, object]) -> Dict[str, object]:
@@ -245,6 +251,7 @@ def get_nous_subscription_features(
 
     web_tool_enabled = _toolset_enabled(config, "web")
     image_tool_enabled = _toolset_enabled(config, "image_gen")
+    video_tool_enabled = _toolset_enabled(config, "video_gen")
     tts_tool_enabled = _toolset_enabled(config, "tts")
     browser_tool_enabled = _toolset_enabled(config, "browser")
     modal_tool_enabled = _toolset_enabled(config, "terminal")
@@ -253,6 +260,7 @@ def get_nous_subscription_features(
     tts_cfg = config.get("tts") if isinstance(config.get("tts"), dict) else {}
     browser_cfg = config.get("browser") if isinstance(config.get("browser"), dict) else {}
     terminal_cfg = config.get("terminal") if isinstance(config.get("terminal"), dict) else {}
+    video_gen_cfg = config.get("video_gen") if isinstance(config.get("video_gen"), dict) else {}
 
     web_backend = str(web_cfg.get("backend") or "").strip().lower()
     # Per-capability overrides: if set, they determine which backend is active for
@@ -260,6 +268,7 @@ def get_nous_subscription_features(
     web_search_backend = str(web_cfg.get("search_backend") or "").strip().lower()
     web_extract_backend = str(web_cfg.get("extract_backend") or "").strip().lower()
     tts_provider = str(tts_cfg.get("provider") or "edge").strip().lower()
+    video_provider = str(video_gen_cfg.get("provider") or "").strip().lower()
     browser_provider_explicit = "cloud_provider" in browser_cfg
     browser_provider = normalize_browser_cloud_provider(
         browser_cfg.get("cloud_provider") if browser_provider_explicit else None
@@ -279,6 +288,7 @@ def get_nous_subscription_features(
     browser_use_gateway = _uses_gateway(browser_cfg)
     image_gen_cfg = config.get("image_gen") if isinstance(config.get("image_gen"), dict) else {}
     image_use_gateway = _uses_gateway(image_gen_cfg)
+    video_use_gateway = _uses_gateway(video_gen_cfg)
 
     direct_exa = bool(get_env_value("EXA_API_KEY"))
     direct_firecrawl = bool(get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL"))
@@ -286,6 +296,8 @@ def get_nous_subscription_features(
     direct_tavily = bool(get_env_value("TAVILY_API_KEY"))
     direct_searxng = bool(get_env_value("SEARXNG_URL"))
     direct_fal = fal_key_is_configured()
+    direct_image_fal = direct_fal
+    direct_video_fal = direct_fal
     direct_openai_tts = bool(resolve_openai_audio_api_key())
     direct_elevenlabs = bool(get_env_value("ELEVENLABS_API_KEY"))
     direct_camofox = bool(get_env_value("CAMOFOX_URL"))
@@ -300,7 +312,9 @@ def get_nous_subscription_features(
         direct_parallel = False
         direct_tavily = False
     if image_use_gateway:
-        direct_fal = False
+        direct_image_fal = False
+    if video_use_gateway:
+        direct_video_fal = False
     if tts_use_gateway:
         direct_openai_tts = False
         direct_elevenlabs = False
@@ -309,7 +323,9 @@ def get_nous_subscription_features(
         direct_browserbase = False
 
     managed_web_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("firecrawl")
-    managed_image_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("fal-queue")
+    managed_fal_queue_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("fal-queue")
+    managed_image_available = managed_fal_queue_available
+    managed_video_available = managed_fal_queue_available
     managed_tts_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("openai-audio")
     managed_browser_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("browser-use")
     managed_modal_available = managed_tools_flag and nous_auth_present and is_managed_tool_gateway_ready("modal")
@@ -342,9 +358,23 @@ def get_nous_subscription_features(
         managed_web_available or direct_exa or direct_firecrawl or direct_parallel or direct_tavily or direct_searxng
     )
 
-    image_managed = image_tool_enabled and managed_image_available and not direct_fal
-    image_active = bool(image_tool_enabled and (image_managed or direct_fal))
-    image_available = bool(managed_image_available or direct_fal)
+    image_managed = image_tool_enabled and managed_image_available and not direct_image_fal
+    image_active = bool(image_tool_enabled and (image_managed or direct_image_fal))
+    image_available = bool(managed_image_available or direct_image_fal)
+
+    video_provider_is_fal = video_provider == "fal"
+    video_managed = (
+        video_tool_enabled
+        and video_provider_is_fal
+        and managed_video_available
+        and not direct_video_fal
+    )
+    video_active = bool(
+        video_tool_enabled
+        and video_provider_is_fal
+        and (video_managed or direct_video_fal)
+    )
+    video_available = bool(managed_video_available or direct_video_fal)
 
     tts_current_provider = tts_provider or "edge"
     tts_managed = (
@@ -437,8 +467,20 @@ def get_nous_subscription_features(
             managed_by_nous=image_managed,
             direct_override=image_active and not image_managed,
             toolset_enabled=image_tool_enabled,
-            current_provider="FAL" if direct_fal else ("Nous Subscription" if image_managed else ""),
+            current_provider="FAL" if direct_image_fal else ("Nous Subscription" if image_managed else ""),
             explicit_configured=direct_fal,
+        ),
+        "video_gen": NousFeatureState(
+            key="video_gen",
+            label="Video generation",
+            included_by_default=False,
+            available=video_available,
+            active=video_active,
+            managed_by_nous=video_managed,
+            direct_override=video_active and not video_managed,
+            toolset_enabled=video_tool_enabled,
+            current_provider="FAL" if direct_video_fal else ("Nous Subscription" if video_managed else video_provider),
+            explicit_configured=bool(video_provider),
         ),
         "tts": NousFeatureState(
             key="tts",
@@ -519,6 +561,11 @@ def apply_nous_managed_defaults(
         browser_cfg = {}
         config["browser"] = browser_cfg
 
+    video_cfg = config.get("video_gen")
+    if not isinstance(video_cfg, dict):
+        video_cfg = {}
+        config["video_gen"] = video_cfg
+
     if "web" in selected_toolsets and not features.web.explicit_configured and not (
         get_env_value("PARALLEL_API_KEY")
         or get_env_value("TAVILY_API_KEY")
@@ -545,6 +592,11 @@ def apply_nous_managed_defaults(
     if "image_gen" in selected_toolsets and not fal_key_is_configured():
         changed.add("image_gen")
 
+    if "video_gen" in selected_toolsets and not fal_key_is_configured():
+        video_cfg["provider"] = "fal"
+        video_cfg["use_gateway"] = True
+        changed.add("video_gen")
+
     return changed
 
 
@@ -555,6 +607,7 @@ def apply_nous_managed_defaults(
 _GATEWAY_TOOL_LABELS = {
     "web": "Web search & extract (Firecrawl)",
     "image_gen": "Image generation (FAL)",
+    "video_gen": "Video generation (FAL)",
     "tts": "Text-to-speech (OpenAI TTS)",
     "browser": "Browser automation (Browser Use)",
 }
@@ -571,6 +624,7 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
             or get_env_value("EXA_API_KEY")
         ),
         "image_gen": fal_key_is_configured(),
+        "video_gen": fal_key_is_configured(),
         "tts": bool(
             resolve_openai_audio_api_key()
             or get_env_value("ELEVENLABS_API_KEY")
@@ -585,11 +639,12 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
 _GATEWAY_DIRECT_LABELS = {
     "web": "Firecrawl/Exa/Parallel/Tavily key",
     "image_gen": "FAL key",
+    "video_gen": "FAL key",
     "tts": "OpenAI/ElevenLabs key",
     "browser": "Browser Use/Browserbase key",
 }
 
-_ALL_GATEWAY_KEYS = ("web", "image_gen", "tts", "browser")
+_ALL_GATEWAY_KEYS = ("web", "image_gen", "video_gen", "tts", "browser")
 
 
 def get_gateway_eligible_tools(
@@ -624,6 +679,7 @@ def get_gateway_eligible_tools(
     opted_in = {
         "web": _uses_gateway(config.get("web")),
         "image_gen": _uses_gateway(config.get("image_gen")),
+        "video_gen": _uses_gateway(config.get("video_gen")),
         "tts": _uses_gateway(config.get("tts")),
         "browser": _uses_gateway(config.get("browser")),
     }
@@ -692,6 +748,15 @@ def apply_gateway_defaults(
         image_cfg["use_gateway"] = True
         changed.add("image_gen")
 
+    if "video_gen" in tool_keys:
+        video_cfg = config.get("video_gen")
+        if not isinstance(video_cfg, dict):
+            video_cfg = {}
+            config["video_gen"] = video_cfg
+        video_cfg["provider"] = "fal"
+        video_cfg["use_gateway"] = True
+        changed.add("video_gen")
+
     return changed
 
 
@@ -717,7 +782,7 @@ def prompt_enable_tool_gateway(config: Dict[str, object]) -> set[str]:
     desc_parts: list[str] = [
         "",
         "  The Tool Gateway gives you access to web search, image generation,",
-        "  text-to-speech, and browser automation through your Nous subscription.",
+        "  video generation, text-to-speech, and browser automation through your Nous subscription.",
         "  No need to sign up for separate API keys — just pick the tools you want.",
         "",
     ]

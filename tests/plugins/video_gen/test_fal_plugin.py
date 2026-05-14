@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 from agent import video_gen_registry
@@ -87,16 +90,132 @@ def test_fal_unavailable_without_key(monkeypatch):
     from plugins.video_gen.fal import FALVideoGenProvider
 
     monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.setattr("plugins.video_gen.fal._resolve_managed_fal_gateway", lambda: None)
     assert FALVideoGenProvider().is_available() is False
 
 
-def test_fal_generate_requires_fal_key(monkeypatch):
+def test_fal_available_with_managed_gateway(monkeypatch):
+    from plugins.video_gen import fal as fal_plugin
     from plugins.video_gen.fal import FALVideoGenProvider
 
     monkeypatch.delenv("FAL_KEY", raising=False)
+    fake_fal = types.ModuleType("fal_client")
+    monkeypatch.setitem(sys.modules, "fal_client", fake_fal)
+    fal_plugin._fal_client = None
+    monkeypatch.setattr(
+        fal_plugin,
+        "_resolve_managed_fal_gateway",
+        lambda: types.SimpleNamespace(
+            gateway_origin="http://127.0.0.1:3009",
+            nous_user_token="nous-token",
+        ),
+    )
+
+    assert FALVideoGenProvider().is_available() is True
+
+
+def test_fal_generate_requires_fal_key_or_managed_gateway(monkeypatch):
+    from plugins.video_gen.fal import FALVideoGenProvider
+
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.setattr("plugins.video_gen.fal._resolve_managed_fal_gateway", lambda: None)
     result = FALVideoGenProvider().generate("a happy dog")
     assert result["success"] is False
     assert result["error_type"] == "auth_required"
+
+
+def test_fal_generate_uses_managed_gateway_when_direct_key_absent(monkeypatch):
+    from plugins.video_gen import fal as fal_plugin
+    from plugins.video_gen.fal import FALVideoGenProvider
+
+    captured = {}
+
+    fake_fal = types.ModuleType("fal_client")
+
+    def _subscribe(endpoint, arguments=None, with_logs=False):
+        raise AssertionError("managed FAL video generation should not call fal_client.subscribe")
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "request_id": "req-video-123",
+                "response_url": "http://127.0.0.1:3009/fal-ai/veo3.1/requests/req-video-123",
+                "status_url": "http://127.0.0.1:3009/fal-ai/veo3.1/requests/req-video-123/status",
+                "cancel_url": "http://127.0.0.1:3009/fal-ai/veo3.1/requests/req-video-123/cancel",
+            }
+
+    def _maybe_retry_request(client, method, url, json=None, timeout=None, headers=None):
+        captured["http_client"] = client
+        captured["method"] = method
+        captured["url"] = url
+        captured["arguments"] = json
+        captured["timeout"] = timeout
+        captured["headers"] = headers
+        return FakeResponse()
+
+    class SyncRequestHandle:
+        def __init__(self, request_id, response_url, status_url, cancel_url, client):
+            captured["request_id"] = request_id
+            captured["response_url"] = response_url
+            captured["status_url"] = status_url
+            captured["cancel_url"] = cancel_url
+            captured["handle_client"] = client
+
+        def get(self):
+            return {"video": {"url": "https://fal.media/out.mp4", "content_type": "video/mp4"}}
+
+    class SyncClient:
+        def __init__(self, key=None, default_timeout=120.0):
+            captured["client_key"] = key
+            self.default_timeout = default_timeout
+            self._client = object()
+
+    fake_fal.subscribe = _subscribe  # type: ignore[attr-defined]
+    fake_fal.SyncClient = SyncClient  # type: ignore[attr-defined]
+    fake_fal.client = types.SimpleNamespace(
+        _maybe_retry_request=_maybe_retry_request,
+        _raise_for_status=lambda response: None,
+        SyncRequestHandle=SyncRequestHandle,
+    )
+    monkeypatch.setitem(sys.modules, "fal_client", fake_fal)
+
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    fal_plugin._fal_client = None
+    fal_plugin._managed_fal_client = None
+    fal_plugin._managed_fal_client_config = None
+    monkeypatch.setattr(fal_plugin.uuid, "uuid4", lambda: "video-submit-123")
+    monkeypatch.setattr(
+        fal_plugin,
+        "_resolve_managed_fal_gateway",
+        lambda: types.SimpleNamespace(
+            gateway_origin="http://127.0.0.1:3009",
+            nous_user_token="nous-token",
+        ),
+    )
+
+    result = FALVideoGenProvider().generate(
+        "a dog running",
+        model="veo3.1",
+        duration=8,
+        aspect_ratio="16:9",
+        resolution="1080p",
+        audio=True,
+    )
+
+    assert result["success"] is True
+    assert result["video"] == "https://fal.media/out.mp4"
+    assert result["endpoint"] == "fal-ai/veo3.1"
+    assert captured["client_key"] == "nous-token"
+    assert captured["method"] == "POST"
+    assert captured["url"] == "http://127.0.0.1:3009/fal-ai/veo3.1"
+    assert captured["arguments"] == {
+        "prompt": "a dog running",
+        "aspect_ratio": "16:9",
+        "resolution": "1080p",
+        "duration": "8",
+        "generate_audio": True,
+    }
+    assert captured["headers"] == {"x-idempotency-key": "video-submit-123"}
 
 
 class TestFamilyRouting:

@@ -146,3 +146,27 @@ class TestReconfigureWritesProvider:
         assert config["video_gen"]["provider"] == "noenv_video"
         assert config["video_gen"]["model"] == "noenv_video-video-v1"
         assert config["video_gen"]["use_gateway"] is False
+
+    def test_reconfigure_managed_fal_video_sets_gateway_flag(
+        self, monkeypatch, tmp_path
+    ):
+        """The Nous Subscription row selects FAL video with use_gateway enabled."""
+        from hermes_cli import tools_config
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        video_gen_registry.register_provider(_FakeVideoProvider("fal"))
+        monkeypatch.setattr(tools_config, "_prompt_choice", lambda *a, **kw: 0)
+
+        config: dict = {}
+        provider_row = {
+            "name": "Nous Subscription",
+            "env_vars": [],
+            "managed_nous_feature": "video_gen",
+            "video_gen_plugin_name": "fal",
+        }
+
+        tools_config._reconfigure_provider(provider_row, config)
+
+        assert config["video_gen"]["provider"] == "fal"
+        assert config["video_gen"]["model"] == "pixverse-v6"
+        assert config["video_gen"]["use_gateway"] is True

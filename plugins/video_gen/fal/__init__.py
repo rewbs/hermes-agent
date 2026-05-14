@@ -26,20 +26,30 @@ Selection precedence for the active family:
     4. ``video_gen.model`` in ``config.yaml`` (when it's one of our family IDs)
     5. ``DEFAULT_MODEL``
 
-Authentication via ``FAL_KEY``. Output is an HTTPS URL from FAL's CDN; the
-gateway downloads and delivers it.
+Authentication uses ``FAL_KEY`` for direct FAL calls or the Nous managed
+FAL queue gateway when ``video_gen.use_gateway`` is enabled. Output is an
+HTTPS URL from FAL's CDN; the gateway downloads and delivers it.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 from agent.video_gen_provider import (
     VideoGenProvider,
     error_response,
     success_response,
+)
+from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.tool_backend_helpers import (
+    fal_key_is_configured,
+    managed_nous_tools_enabled,
+    prefers_gateway,
 )
 
 logger = logging.getLogger(__name__)
@@ -286,6 +296,9 @@ def _build_payload(
 # ---------------------------------------------------------------------------
 
 _fal_client: Any = None
+_managed_fal_client: Any = None
+_managed_fal_client_config: Optional[Tuple[str, str]] = None
+_managed_fal_client_lock = threading.Lock()
 
 
 def _load_fal_client() -> Any:
@@ -296,6 +309,133 @@ def _load_fal_client() -> Any:
 
     _fal_client = fal_client
     return fal_client
+
+
+# ---------------------------------------------------------------------------
+# Managed FAL queue gateway (Nous Subscription)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_managed_fal_gateway():
+    """Return managed fal-queue gateway config for video generation.
+
+    Direct FAL credentials win by default. Setting ``video_gen.use_gateway``
+    forces gateway routing, matching image generation's managed-mode behavior.
+    """
+    if fal_key_is_configured() and not prefers_gateway("video_gen"):
+        return None
+    return resolve_managed_tool_gateway("fal-queue")
+
+
+def _normalize_fal_queue_url_format(queue_run_origin: str) -> str:
+    normalized_origin = str(queue_run_origin or "").strip().rstrip("/")
+    if not normalized_origin:
+        raise ValueError("Managed FAL queue origin is required")
+    return f"{normalized_origin}/"
+
+
+class _ManagedFalQueueClient:
+    """Small wrapper around fal_client.SyncClient for managed queue hosts."""
+
+    def __init__(self, *, key: str, queue_run_origin: str):
+        fal_client = _load_fal_client()
+        sync_client_class = getattr(fal_client, "SyncClient", None)
+        if sync_client_class is None:
+            raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
+
+        client_module = getattr(fal_client, "client", None)
+        if client_module is None:
+            raise RuntimeError("fal_client.client is required for managed FAL gateway mode")
+
+        self._queue_url_format = _normalize_fal_queue_url_format(queue_run_origin)
+        self._sync_client = sync_client_class(key=key)
+        self._http_client = getattr(self._sync_client, "_client", None)
+        self._maybe_retry_request = getattr(client_module, "_maybe_retry_request", None)
+        self._raise_for_status = getattr(client_module, "_raise_for_status", None)
+        self._request_handle_class = getattr(client_module, "SyncRequestHandle", None)
+
+        if self._http_client is None:
+            raise RuntimeError("fal_client.SyncClient._client is required for managed FAL gateway mode")
+        if self._maybe_retry_request is None or self._raise_for_status is None:
+            raise RuntimeError("fal_client.client request helpers are required for managed FAL gateway mode")
+        if self._request_handle_class is None:
+            raise RuntimeError("fal_client.client.SyncRequestHandle is required for managed FAL gateway mode")
+
+    def submit(
+        self,
+        application: str,
+        arguments: Dict[str, Any],
+        *,
+        path: str = "",
+        webhook_url: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        url = self._queue_url_format + application
+        if path:
+            url += "/" + path.lstrip("/")
+        if webhook_url is not None:
+            url += "?" + urlencode({"fal_webhook": webhook_url})
+
+        response = self._maybe_retry_request(
+            self._http_client,
+            "POST",
+            url,
+            json=arguments,
+            timeout=getattr(self._sync_client, "default_timeout", 120.0),
+            headers=dict(headers or {}),
+        )
+        self._raise_for_status(response)
+
+        data = response.json()
+        return self._request_handle_class(
+            request_id=data["request_id"],
+            response_url=data["response_url"],
+            status_url=data["status_url"],
+            cancel_url=data["cancel_url"],
+            client=self._http_client,
+        )
+
+
+def _get_managed_fal_client(managed_gateway):
+    """Reuse the managed FAL client so its internal http client is not leaked."""
+    global _managed_fal_client, _managed_fal_client_config
+
+    client_config = (
+        managed_gateway.gateway_origin.rstrip("/"),
+        managed_gateway.nous_user_token,
+    )
+    with _managed_fal_client_lock:
+        if _managed_fal_client is not None and _managed_fal_client_config == client_config:
+            return _managed_fal_client
+
+        _managed_fal_client = _ManagedFalQueueClient(
+            key=managed_gateway.nous_user_token,
+            queue_run_origin=managed_gateway.gateway_origin,
+        )
+        _managed_fal_client_config = client_config
+        return _managed_fal_client
+
+
+def _submit_managed_fal_request(endpoint: str, arguments: Dict[str, Any], managed_gateway):
+    request_headers = {"x-idempotency-key": str(uuid.uuid4())}
+    managed_client = _get_managed_fal_client(managed_gateway)
+    return managed_client.submit(
+        endpoint,
+        arguments=arguments,
+        headers=request_headers,
+    )
+
+
+def _extract_http_status(exc: BaseException) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            return status
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +459,10 @@ class FALVideoGenProvider(VideoGenProvider):
         return "FAL"
 
     def is_available(self) -> bool:
-        if not os.environ.get("FAL_KEY", "").strip():
+        if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
             return False
         try:
-            import fal_client  # noqa: F401
+            _load_fal_client()
         except ImportError:
             return False
         return True
@@ -390,12 +530,13 @@ class FALVideoGenProvider(VideoGenProvider):
         seed: Optional[int] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        if not os.environ.get("FAL_KEY", "").strip():
+        managed_gateway = _resolve_managed_fal_gateway()
+        if not (fal_key_is_configured() or managed_gateway):
+            message = "FAL_KEY not set"
+            if managed_nous_tools_enabled():
+                message += " and managed FAL gateway is unavailable"
             return error_response(
-                error=(
-                    "FAL_KEY not set. Run `hermes tools` → Video Generation "
-                    "→ FAL to configure."
-                ),
+                error=f"{message}. Run `hermes tools` → Video Generation → FAL to configure.",
                 error_type="auth_required",
                 provider="fal",
                 prompt=prompt,
@@ -463,18 +604,35 @@ class FALVideoGenProvider(VideoGenProvider):
         )
 
         try:
-            result = fal_client.subscribe(
-                endpoint,
-                arguments=payload,
-                with_logs=False,
-            )
+            if managed_gateway:
+                result = _submit_managed_fal_request(
+                    endpoint,
+                    payload,
+                    managed_gateway,
+                ).get()
+            else:
+                result = fal_client.subscribe(
+                    endpoint,
+                    arguments=payload,
+                    with_logs=False,
+                )
         except Exception as exc:
+            status = _extract_http_status(exc) if managed_gateway else None
+            error = f"FAL video generation failed: {exc}"
+            if status is not None and 400 <= status < 500:
+                error = (
+                    f"Nous Subscription gateway rejected FAL video endpoint "
+                    f"'{endpoint}' (HTTP {status}). This model may not yet be "
+                    f"enabled on the Nous Portal's FAL proxy. Set FAL_KEY to "
+                    f"use FAL.ai directly, or pick a different video model via "
+                    f"`hermes tools` → Video Generation."
+                )
             logger.warning(
                 "FAL video gen failed (family=%s, endpoint=%s): %s",
                 family_id, endpoint, exc, exc_info=True,
             )
             return error_response(
-                error=f"FAL video generation failed: {exc}",
+                error=error,
                 error_type="api_error",
                 provider="fal", model=family_id, prompt=prompt,
                 aspect_ratio=aspect_ratio,

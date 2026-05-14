@@ -304,11 +304,20 @@ TOOL_CATEGORIES = {
     "video_gen": {
         "name": "Video Generation",
         "icon": "🎬",
-        # Providers list is intentionally empty — every video gen backend
-        # is a plugin, surfaced by ``_plugin_video_gen_providers()`` and
-        # injected by ``_visible_providers``. Mirrors the design we'll
-        # converge image_gen toward.
-        "providers": [],
+        # FAL is a plugin, but the managed Nous Subscription row is a
+        # setup-flow shortcut that selects the FAL plugin with use_gateway.
+        "providers": [
+            {
+                "name": "Nous Subscription",
+                "badge": "subscription",
+                "tag": "Managed FAL video generation billed to your subscription",
+                "env_vars": [],
+                "requires_nous_auth": True,
+                "managed_nous_feature": "video_gen",
+                "override_env_vars": ["FAL_KEY"],
+                "video_gen_plugin_name": "fal",
+            },
+        ],
     },
     "browser": {
         "name": "Browser Automation",
@@ -1489,10 +1498,9 @@ def _plugin_image_gen_providers() -> list[dict]:
 def _plugin_video_gen_providers() -> list[dict]:
     """Build picker-row dicts from plugin-registered video gen providers.
 
-    Mirrors ``_plugin_image_gen_providers`` exactly — every video backend
-    is a plugin, so this function is the *only* source of provider rows
-    for the Video Generation category. The hardcoded ``TOOL_CATEGORIES``
-    entry for ``video_gen`` keeps an empty providers list.
+    Mirrors ``_plugin_image_gen_providers`` exactly. Every real video
+    backend is a plugin; hardcoded rows in ``TOOL_CATEGORIES`` are setup
+    shortcuts such as the Nous Subscription managed-gateway entry.
     """
     try:
         from agent.video_gen_registry import list_providers
@@ -1597,8 +1605,8 @@ def _visible_providers(cat: dict, config: dict) -> list[dict]:
     if cat.get("name") == "Image Generation":
         visible.extend(_plugin_image_gen_providers())
 
-    # Inject plugin-registered video_gen backends. Unlike image_gen,
-    # video_gen has NO hardcoded providers — every backend is a plugin.
+    # Inject plugin-registered video_gen backends. Hardcoded video rows
+    # are setup shortcuts; real backends still come from the plugin registry.
     if cat.get("name") == "Video Generation":
         visible.extend(_plugin_video_gen_providers())
 
@@ -1783,6 +1791,15 @@ def _is_provider_active(provider: dict, config: dict) -> bool:
         image_cfg = config.get("image_gen", {})
         return isinstance(image_cfg, dict) and image_cfg.get("provider") == plugin_name
 
+    video_plugin_name = provider.get("video_gen_plugin_name")
+    if video_plugin_name and not provider.get("managed_nous_feature"):
+        video_cfg = config.get("video_gen", {})
+        return (
+            isinstance(video_cfg, dict)
+            and video_cfg.get("provider") == video_plugin_name
+            and not is_truthy_value(video_cfg.get("use_gateway"), default=False)
+        )
+
     managed_feature = provider.get("managed_nous_feature")
     if managed_feature:
         features = get_nous_subscription_features(config)
@@ -1796,6 +1813,15 @@ def _is_provider_active(provider: dict, config: dict) -> bool:
                 if configured_provider not in {None, "", "fal"}:
                     return False
                 if image_cfg.get("use_gateway") is not None and not is_truthy_value(image_cfg.get("use_gateway"), default=False):
+                    return False
+            return feature.managed_by_nous
+        if managed_feature == "video_gen":
+            video_cfg = config.get("video_gen", {})
+            if isinstance(video_cfg, dict):
+                configured_provider = video_cfg.get("provider")
+                if provider.get("video_gen_plugin_name") and configured_provider != provider["video_gen_plugin_name"]:
+                    return False
+                if video_cfg.get("use_gateway") is not None and not is_truthy_value(video_cfg.get("use_gateway"), default=False):
                     return False
             return feature.managed_by_nous
         if provider.get("tts_provider"):
@@ -2126,14 +2152,14 @@ def _configure_videogen_model_for_plugin(plugin_name: str, config: dict) -> None
     _print_success(f"  Model set to: {chosen}")
 
 
-def _select_plugin_video_gen_provider(plugin_name: str, config: dict) -> None:
+def _select_plugin_video_gen_provider(plugin_name: str, config: dict, *, use_gateway: bool = False) -> None:
     """Persist a plugin-backed video generation provider selection."""
     vid_cfg = config.setdefault("video_gen", {})
     if not isinstance(vid_cfg, dict):
         vid_cfg = {}
         config["video_gen"] = vid_cfg
     vid_cfg["provider"] = plugin_name
-    vid_cfg["use_gateway"] = False
+    vid_cfg["use_gateway"] = bool(use_gateway)
     _print_success(f"  video_gen.provider set to: {plugin_name}")
     _configure_videogen_model_for_plugin(plugin_name, config)
 
@@ -2204,7 +2230,11 @@ def _configure_provider(provider: dict, config: dict):
         # registry.
         video_plugin = provider.get("video_gen_plugin_name")
         if video_plugin:
-            _select_plugin_video_gen_provider(video_plugin, config)
+            _select_plugin_video_gen_provider(
+                video_plugin,
+                config,
+                use_gateway=bool(managed_feature),
+            )
             return
         # Imagegen backends prompt for model selection after backend pick.
         backend = provider.get("imagegen_backend")
@@ -2256,7 +2286,11 @@ def _configure_provider(provider: dict, config: dict):
             return
         video_plugin = provider.get("video_gen_plugin_name")
         if video_plugin:
-            _select_plugin_video_gen_provider(video_plugin, config)
+            _select_plugin_video_gen_provider(
+                video_plugin,
+                config,
+                use_gateway=bool(managed_feature),
+            )
             return
         # Imagegen backends prompt for model selection after env vars are in.
         backend = provider.get("imagegen_backend")
@@ -2485,7 +2519,11 @@ def _reconfigure_provider(provider: dict, config: dict):
         # Plugin-registered video_gen provider — same flow, different registry.
         video_plugin = provider.get("video_gen_plugin_name")
         if video_plugin:
-            _select_plugin_video_gen_provider(video_plugin, config)
+            _select_plugin_video_gen_provider(
+                video_plugin,
+                config,
+                use_gateway=bool(managed_feature),
+            )
             return
         # Imagegen backends prompt for model selection on reconfig too.
         backend = provider.get("imagegen_backend")
@@ -2522,7 +2560,11 @@ def _reconfigure_provider(provider: dict, config: dict):
     # Plugin-registered video_gen provider — same flow, different registry.
     video_plugin = provider.get("video_gen_plugin_name")
     if video_plugin:
-        _select_plugin_video_gen_provider(video_plugin, config)
+        _select_plugin_video_gen_provider(
+            video_plugin,
+            config,
+            use_gateway=bool(managed_feature),
+        )
         return
 
     backend = provider.get("imagegen_backend")

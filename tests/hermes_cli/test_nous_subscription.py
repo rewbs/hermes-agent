@@ -179,7 +179,7 @@ def test_get_gateway_eligible_tools_ignores_quoted_false_opt_in(monkeypatch):
     monkeypatch.setattr(
         ns,
         "_get_gateway_direct_credentials",
-        lambda: {"web": True, "image_gen": False, "tts": False, "browser": False},
+        lambda: {"web": True, "image_gen": False, "video_gen": False, "tts": False, "browser": False},
     )
 
     unconfigured, has_direct, already_managed = ns.get_gateway_eligible_tools(
@@ -191,4 +191,25 @@ def test_get_gateway_eligible_tools_ignores_quoted_false_opt_in(monkeypatch):
 
     assert "web" in has_direct
     assert "web" not in already_managed
-    assert set(unconfigured) == {"image_gen", "tts", "browser"}
+    assert set(unconfigured) == {"image_gen", "video_gen", "tts", "browser"}
+
+
+def test_get_nous_subscription_features_marks_fal_video_as_managed_when_gateway_ready(monkeypatch):
+    monkeypatch.setattr(ns, "get_env_value", lambda name: "")
+    monkeypatch.setattr(ns, "get_nous_auth_status", lambda: {"logged_in": True})
+    monkeypatch.setattr(ns, "managed_nous_tools_enabled", lambda: True)
+    monkeypatch.setattr(ns, "_toolset_enabled", lambda config, key: key == "video_gen")
+    monkeypatch.setattr(ns, "_has_agent_browser", lambda: False)
+    monkeypatch.setattr(ns, "resolve_openai_audio_api_key", lambda: "")
+    monkeypatch.setattr(ns, "has_direct_modal_credentials", lambda: False)
+    monkeypatch.setattr(ns, "is_managed_tool_gateway_ready", lambda vendor: vendor == "fal-queue")
+
+    features = ns.get_nous_subscription_features(
+        {"video_gen": {"provider": "fal", "use_gateway": True}}
+    )
+
+    assert features.video_gen.available is True
+    assert features.video_gen.active is True
+    assert features.video_gen.managed_by_nous is True
+    assert features.video_gen.direct_override is False
+    assert features.video_gen.current_provider == "Nous Subscription"
