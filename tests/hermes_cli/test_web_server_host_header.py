@@ -148,6 +148,96 @@ class TestHostHeaderMiddleware:
         assert resp.status_code != 400
 
 
+class TestInsecurePublicDashboardShellAuth:
+    """`--host 0.0.0.0 --insecure` must not serve the SPA anonymously.
+
+    In this mode the SPA bootstrap contains the legacy session token used by
+    REST and WebSocket calls. Serving it to any reachable client makes the
+    token meaningless, so the dashboard shell itself needs the same token gate.
+    """
+
+    def _client(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server.app.state, "bound_host", "0.0.0.0", raising=False)
+        monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
+        return web_server, TestClient(web_server.app, base_url="http://10.0.0.5:9119")
+
+    def test_dashboard_shell_rejects_missing_token(self, monkeypatch):
+        web_server, client = self._client(monkeypatch)
+
+        resp = client.get("/", follow_redirects=False)
+
+        assert resp.status_code == 401
+        assert "dashboard locked" in resp.text
+        assert resp.headers["www-authenticate"].startswith("Basic ")
+        assert web_server._SESSION_TOKEN not in resp.text
+
+    def test_basic_auth_allows_dashboard_shell_and_sets_cookie(self, monkeypatch):
+        import base64
+
+        web_server, client = self._client(monkeypatch)
+        credentials = (
+            f"{web_server._SESSION_BASIC_AUTH_USERNAME}:{web_server._SESSION_TOKEN}"
+        ).encode()
+        encoded = base64.b64encode(credentials).decode()
+
+        resp = client.get(
+            "/",
+            headers={"Authorization": f"Basic {encoded}"},
+            follow_redirects=False,
+        )
+
+        assert resp.status_code != 401
+        assert web_server._SESSION_COOKIE_NAME in resp.headers["set-cookie"]
+
+    def test_wrong_basic_auth_is_rejected(self, monkeypatch):
+        import base64
+
+        _web_server, client = self._client(monkeypatch)
+        encoded = base64.b64encode(b"hermes:not-the-token").decode()
+
+        resp = client.get(
+            "/",
+            headers={"Authorization": f"Basic {encoded}"},
+            follow_redirects=False,
+        )
+
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"].startswith("Basic ")
+
+    def test_query_token_sets_cookie_and_strips_url(self, monkeypatch):
+        web_server, client = self._client(monkeypatch)
+
+        resp = client.get(
+            f"/chat?resume=abc&token={web_server._SESSION_TOKEN}",
+            follow_redirects=False,
+        )
+
+        assert resp.status_code == 303
+        assert "token=" not in resp.headers["location"]
+        assert "resume=abc" in resp.headers["location"]
+        assert web_server._SESSION_COOKIE_NAME in resp.headers["set-cookie"]
+
+    def test_session_cookie_allows_dashboard_shell(self, monkeypatch):
+        web_server, client = self._client(monkeypatch)
+        client.cookies.set(web_server._SESSION_COOKIE_NAME, web_server._SESSION_TOKEN)
+
+        resp = client.get("/", follow_redirects=False)
+
+        assert resp.status_code != 401
+        assert "dashboard locked" not in resp.text
+
+    def test_public_api_status_keeps_existing_public_behavior(self, monkeypatch):
+        _web_server, client = self._client(monkeypatch)
+
+        resp = client.get("/api/status", follow_redirects=False)
+
+        assert resp.status_code != 401
+
+
 class TestWebSocketHostOriginGuard:
     """WebSocket upgrades must enforce the same dashboard boundary as HTTP."""
 

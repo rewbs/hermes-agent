@@ -62,7 +62,7 @@ from utils import env_var_enabled
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -74,7 +74,7 @@ except ImportError:
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel
     except Exception:
@@ -134,6 +134,8 @@ app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+_SESSION_COOKIE_NAME = "hermes_dashboard_session"
+_SESSION_BASIC_AUTH_USERNAME = "hermes"
 
 # In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
 # or HERMES_DASHBOARD_TUI=1.  Set from :func:`start_server`.
@@ -193,6 +195,34 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
+def _has_valid_session_cookie(request: Request) -> bool:
+    cookie = request.cookies.get(_SESSION_COOKIE_NAME, "")
+    return bool(cookie) and hmac.compare_digest(cookie.encode(), _SESSION_TOKEN.encode())
+
+
+def _has_valid_query_session_token(request: Request) -> bool:
+    token = request.query_params.get("token", "")
+    return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+
+
+def _has_valid_basic_session_auth(request: Request) -> bool:
+    auth = request.headers.get("authorization", "")
+    scheme, _, encoded = auth.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    username, sep, password = decoded.partition(":")
+    if not sep:
+        return False
+    return (
+        hmac.compare_digest(username.encode(), _SESSION_BASIC_AUTH_USERNAME.encode())
+        and hmac.compare_digest(password.encode(), _SESSION_TOKEN.encode())
+    )
+
+
 def _require_token(request: Request) -> None:
     """Validate the ephemeral session token.  Raises 401 on mismatch."""
     if not _has_valid_session_token(request):
@@ -224,6 +254,61 @@ def should_require_auth(host: str, allow_public: bool) -> bool:
     exactly the threat model the gate is designed for.
     """
     return (host not in _LOOPBACK_HOST_VALUES) and (not allow_public)
+
+
+def _is_insecure_public_dashboard_shell_request(request: Request) -> bool:
+    """True when public ``--insecure`` dashboard HTTP shell access needs auth.
+
+    In this mode the OAuth gate is intentionally disabled, but serving the SPA
+    anonymously would leak ``_SESSION_TOKEN`` via the bootstrap script.  The
+    REST API remains guarded by ``auth_middleware`` below; this helper covers
+    the dashboard HTML/static/plugin shell itself.
+    """
+    if getattr(request.app.state, "auth_required", False):
+        return False
+    bound_host = (getattr(request.app.state, "bound_host", "") or "").strip().lower()
+    if not bound_host or bound_host in _LOOPBACK_HOST_VALUES:
+        return False
+    path = request.url.path
+    return not (path == "/api" or path.startswith("/api/"))
+
+
+def _url_without_query_token(request: Request) -> str:
+    params = [
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key != "token"
+    ]
+    query = urllib.parse.urlencode(params)
+    return str(request.url.replace(query=query))
+
+
+def _set_session_cookie(response: Response, request: Request) -> None:
+    response.set_cookie(
+        _SESSION_COOKIE_NAME,
+        _SESSION_TOKEN,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+
+
+def _basic_auth_challenge_response() -> HTMLResponse:
+    return HTMLResponse(
+        (
+            "<!doctype html><title>Hermes dashboard locked</title>"
+            "<h1>Hermes dashboard locked</h1>"
+            "<p>This public insecure dashboard requires authentication. "
+            f"Use username <code>{_SESSION_BASIC_AUTH_USERNAME}</code> and "
+            "the session token printed by the server as the password.</p>"
+        ),
+        status_code=401,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "WWW-Authenticate": 'Basic realm="Hermes Dashboard", charset="UTF-8"',
+        },
+    )
 
 
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
@@ -330,6 +415,24 @@ async def auth_middleware(request: Request, call_next):
                 status_code=401,
                 content={"detail": "Unauthorized"},
             )
+
+    if _is_insecure_public_dashboard_shell_request(request):
+        if _has_valid_session_cookie(request) or _has_valid_session_token(request):
+            return await call_next(request)
+        if _has_valid_basic_session_auth(request):
+            response = await call_next(request)
+            _set_session_cookie(response, request)
+            return response
+        if _has_valid_query_session_token(request):
+            # Bootstrap browser access: accept the token once, then move it into
+            # an HttpOnly cookie and strip it from the visible URL/history.
+            response = RedirectResponse(
+                _url_without_query_token(request),
+                status_code=303,
+            )
+            _set_session_cookie(response, request)
+            return response
+        return _basic_auth_challenge_response()
     return await call_next(request)
 
 
@@ -8607,6 +8710,11 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host, allow_public)
+    insecure_public_shell = (
+        host not in _LOOPBACK_HOST_VALUES
+        and allow_public
+        and not app.state.auth_required
+    )
 
     if app.state.auth_required:
         # Phase 3.5: the gate engages on non-loopback binds.  The legacy
@@ -8659,11 +8767,12 @@ def start_server(
             host,
             ", ".join(p.name for p in list_providers()),
         )
-    elif host not in _LOOPBACK_HOST_VALUES and allow_public:
-        # --insecure path — no auth, loud warning.
+    elif insecure_public_shell:
+        # --insecure path — session-token gate for the dashboard shell, loud warning.
         _log.warning(
-            "Binding to %s with --insecure — the dashboard has no robust "
-            "authentication. Only use on trusted networks.", host,
+            "Binding to %s with --insecure — the dashboard shell requires "
+            "the process session token, but this is not a substitute for TLS "
+            "or a real identity provider. Only use on trusted networks.", host,
         )
 
     # Record the bound host so host_header_middleware can validate incoming
@@ -8693,7 +8802,12 @@ def start_server(
             def _open():
                 try:
                     time.sleep(1.0)
-                    webbrowser.open(f"http://{host}:{port}")
+                    url = (
+                        f"http://{host}:{port}/?token={urllib.parse.quote(_SESSION_TOKEN)}"
+                        if insecure_public_shell
+                        else f"http://{host}:{port}"
+                    )
+                    webbrowser.open(url)
                 except Exception:
                     pass
 
@@ -8705,6 +8819,16 @@ def start_server(
             )
 
     print(f"  Hermes Web UI → http://{host}:{port}")
+    if insecure_public_shell:
+        print(
+            "  Public insecure access requires this token entry URL "
+            f"(replace 0.0.0.0 with the reachable host/IP if needed): "
+            f"http://{host}:{port}/?token={urllib.parse.quote(_SESSION_TOKEN)}"
+        )
+        print(
+            "  Or open the bare URL and use Basic Auth "
+            f"username '{_SESSION_BASIC_AUTH_USERNAME}' with that token as the password."
+        )
     # proxy_headers defaults to False so _ws_client_is_allowed sees the real
     # connection peer rather than X-Forwarded-For's rewritten value (which
     # would defeat the loopback gate when behind a reverse proxy).  When the
