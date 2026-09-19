@@ -1,0 +1,206 @@
+"""Nous free tier: the browser challenge in front of a token exchange (``hermes_cli.anon_challenge``).
+
+Driven through the fake NAS with Hermes' real client code: the exchange hits a 428, the challenge is
+presented and polled OUTSIDE the auth locks, and the exchange runs once more.
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+
+from hermes_cli import anon_auth, anon_challenge
+
+from tests.hermes_cli.anon_portal import PORTAL, install_portal  # noqa: F401
+
+
+@pytest.fixture
+def nas(monkeypatch, tmp_path):
+    return install_portal(monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def presented(monkeypatch):
+    seen: list[anon_challenge.BrowserChallenge] = []
+    monkeypatch.setattr(anon_challenge, "_presenter", seen.append)
+    return seen
+
+
+def _resolve():
+    from hermes_cli.auth_nous import resolve_nous_runtime_credentials
+    assert anon_auth.is_guest_state(anon_auth.ensure_portal_identity(explicit=True))
+    return resolve_nous_runtime_credentials()
+
+
+class TestWhatTheClientSends:
+    def test_the_exchange_reports_surface_version_and_the_browser_capability(self, nas):
+        _resolve()
+        sent = nas.token_requests[-1]
+        assert sent["body"]["client"]["capabilities"] == ["browser-v1"]
+        assert sent["body"]["client"]["surface"] == "cli"
+        assert sent["body"]["client"]["name"] == "hermes-agent"
+        assert sent["user_agent"].startswith("hermes-agent/") and "(cli;" in sent["user_agent"]
+
+    def test_the_desktop_backend_reports_the_desktop_surface(self, nas, monkeypatch):
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        _resolve()
+        assert nas.token_requests[-1]["body"]["client"]["surface"] == "desktop"
+        assert "(desktop;" in nas.token_requests[-1]["user_agent"]
+
+
+class TestRequiredChallenge:
+    def test_a_challenge_is_presented_polled_and_the_exchange_retried(self, nas, presented):
+        nas.challenge_required = True
+        nas.challenge_statuses = ["pending", "pending", "needs_interaction"]
+        creds = _resolve()
+        assert creds["api_key"]
+        assert [c.url for c in presented] == [nas.challenge_url]
+        assert presented[0].required and presented[0].message == "A quick check first."
+        paths = [p for _, p in nas.calls]
+        assert paths.count("/api/anonymous/token") == 2
+        # the three scripted states (the first answers "is it already settled?") + the settling "none"
+        assert paths.count("/api/anonymous/challenge/status") == 4
+        assert anon_challenge.pending_challenge() is None
+
+    def test_the_wait_happens_outside_the_auth_locks(self, nas, monkeypatch):
+        """A sibling process must be able to take the shared-store lock while the page runs."""
+        from hermes_cli.auth_nous import _nous_shared_store_lock
+        nas.challenge_required = True
+        nas.challenge_statuses = ["pending"]
+
+        def present(_challenge):
+            with _nous_shared_store_lock(timeout_seconds=0.5):
+                pass
+        monkeypatch.setattr(anon_challenge, "_presenter", present)
+        assert _resolve()["api_key"]
+
+    def test_status_shows_the_pending_challenge_while_it_is_worked(self, nas, monkeypatch):
+        nas.challenge_required = True
+        nas.challenge_statuses = ["pending"]
+        seen = []
+        monkeypatch.setattr(anon_challenge, "_presenter", lambda _c: seen.append(anon_challenge.pending_challenge()))
+        _resolve()
+        assert seen == [{"type": "browser", "url": nas.challenge_url, "required": True,
+                         "expires_in": 600, "message": "A quick check first."}]
+
+    def test_a_challenge_that_never_clears_is_a_retryable_error_not_a_hang(self, nas, presented, monkeypatch):
+        nas.challenge_required = True
+        nas.challenge_never_clears = True
+        monkeypatch.setattr(anon_challenge, "CHALLENGE_WAIT_SECONDS", 0.05)
+        monkeypatch.setattr(anon_challenge, "_sleep", lambda _seconds: __import__("time").sleep(0.02))
+        with pytest.raises(anon_auth.AuthError) as exc:
+            _resolve()
+        assert exc.value.code == anon_auth.ANON_CHALLENGE_REQUIRED and exc.value.retryable is True
+        assert "browser" in str(exc.value)
+        # The callers queued behind it fail fast instead of each parking for a full wait.
+        from hermes_cli.auth_nous import resolve_nous_runtime_credentials
+        with pytest.raises(anon_auth.AuthError):
+            resolve_nous_runtime_credentials()
+        assert len(presented) == 1
+
+    def test_a_second_challenge_after_the_retry_is_not_looped_on(self, nas, presented):
+        nas.challenge_required = True
+        nas.challenge_statuses = ["failed"]          # the page ruled; the ticket left the waiting states
+
+        original = nas.handler
+
+        def still_challenged(request):
+            response = original(request)
+            nas.challenge_required = True            # NAS keeps answering 428
+            return response
+        nas.handler = still_challenged
+        with pytest.raises(anon_auth.AuthError) as exc:
+            _resolve()
+        assert exc.value.code == anon_auth.ANON_CHALLENGE_REQUIRED
+        assert [p for _, p in nas.calls].count("/api/anonymous/token") == 2
+
+    def test_the_managed_tool_token_path_works_a_challenge_too(self, nas, presented):
+        from hermes_cli.auth import resolve_nous_access_token
+        assert anon_auth.is_guest_state(anon_auth.ensure_portal_identity(explicit=True))
+        nas.challenge_required = True
+        nas.challenge_statuses = ["pending"]
+        assert resolve_nous_access_token()
+        assert len(presented) == 1
+
+
+class TestWhatIsNeverOpened:
+    def test_a_challenge_url_off_the_portal_origin_is_refused(self, nas, presented):
+        nas.challenge_required = True
+        nas.challenge_url = "https://evil.example/challenge?code=x"
+        with pytest.raises(anon_auth.AuthError) as exc:
+            _resolve()
+        assert exc.value.code == anon_auth.ANON_SIGNIN_REQUIRED and exc.value.retryable is False
+        assert presented == []
+
+    @pytest.mark.parametrize("url", [
+        "javascript:alert(1)", "file:///etc/passwd", f"{PORTAL}.evil.example/challenge",
+        PORTAL.replace("https://", "http://") + "/challenge", "", None])
+    def test_same_origin_means_scheme_and_host(self, url):
+        payload = {"challenges": [{"type": "browser", "url": url}]}
+        assert anon_challenge.parse_browser_challenge(payload, PORTAL) is None
+
+    def test_an_unknown_challenge_type_falls_back_to_sign_in(self, nas, presented):
+        nas.token_response = httpx.Response(428, json={
+            "error": "challenge_required", "message": "Attest your device.",
+            "challenges": [{"type": "attestation-v9", "url": f"{PORTAL}/x"}]})
+        with pytest.raises(anon_auth.AuthError) as exc:
+            _resolve()
+        assert exc.value.code == anon_auth.ANON_SIGNIN_REQUIRED
+        assert "Sign in" in str(exc.value) and "Attest" not in str(exc.value)
+
+    def test_an_unknown_428_is_a_sign_in_not_the_proof_of_work_sentence(self, nas):
+        nas.token_response = httpx.Response(428, json={"error": "something_new"})
+        with pytest.raises(anon_auth.AuthError) as exc:
+            _resolve()
+        assert exc.value.code == anon_auth.ANON_SIGNIN_REQUIRED
+        assert "proof of work" not in str(exc.value)
+
+    @pytest.mark.parametrize("error", ["signin_required", "access_denied"])
+    def test_a_refusal_uses_the_services_own_words(self, nas, error):
+        nas.token_response = httpx.Response(403, json={"error": error, "message": "Not from here, sorry."})
+        with pytest.raises(anon_auth.AuthError) as exc:
+            _resolve()
+        assert exc.value.code == anon_auth.ANON_SIGNIN_REQUIRED and str(exc.value) == "Not from here, sorry."
+
+    def test_server_copy_is_only_used_when_it_looks_like_copy(self):
+        assert anon_challenge.server_message("  Two\n lines  ") == "Two lines"
+        assert anon_challenge.server_message("x" * 301) == ""
+        assert anon_challenge.server_message({"not": "text"}) == ""
+
+
+class TestOptionalChallenge:
+    def test_a_terminal_never_opens_anything_for_an_optional_challenge(self, nas, presented, monkeypatch):
+        announced = []
+        monkeypatch.setattr(anon_challenge, "_announce", announced.append)
+        nas.optional_challenge = True
+        assert _resolve()["api_key"]
+        assert presented == [] and announced == []
+
+    def test_the_desktop_backend_announces_it_and_waits_on_nothing(self, nas, presented, monkeypatch):
+        announced = []
+        monkeypatch.setattr(anon_challenge, "_announce", announced.append)
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        nas.optional_challenge = True
+        assert _resolve()["api_key"]
+        assert [c.required for c in announced] == [False]
+        assert "/api/anonymous/challenge/status" not in [p for _, p in nas.calls]
+
+
+class TestPresenting:
+    def test_the_desktop_backend_announces_and_never_opens_a_browser(self, monkeypatch):
+        announced, opened = [], []
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(anon_challenge, "_announce", announced.append)
+        monkeypatch.setattr(anon_challenge, "_present_in_terminal", opened.append)
+        challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "m")
+        anon_challenge.present(challenge)
+        assert announced == [challenge] and opened == []
+
+    def test_a_terminal_prints_the_link_and_skips_the_browser_over_ssh(self, monkeypatch, capsys):
+        import webbrowser
+        monkeypatch.setenv("SSH_TTY", "/dev/pts/0")
+        monkeypatch.setattr(webbrowser, "open", lambda _url: pytest.fail("opened a browser over SSH"))
+        challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "A quick check.")
+        anon_challenge.present(challenge)
+        err = capsys.readouterr().err
+        assert "A quick check." in err and f"{PORTAL}/challenge?code=t" in err

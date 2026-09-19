@@ -39,6 +39,12 @@ def _(rid, params: dict) -> dict:
             # Why there is no identity, when the last attempt to make one failed:
             # ``{error, error_code, retryable, retry_after}`` (the mint memo's verdict).
             payload.update(anon_auth.last_mint_failure() or {})
+        # A browser challenge the account service is waiting on (``anon_challenge``): the same
+        # payload the ``free_tier.challenge`` event carried, for a client that connected after it.
+        from hermes_cli import anon_challenge
+        challenge = anon_challenge.pending_challenge()
+        if challenge:
+            payload["challenge"] = challenge
         return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5090, str(e))
