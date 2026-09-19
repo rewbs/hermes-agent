@@ -47,6 +47,8 @@ class FakePortal:
         self.challenge_required = False
         self.challenge_never_clears = False
         self.challenge_statuses: list[str] = []
+        # Status polls answered with this HTTP error first (a 429 / 5xx blip), one per entry.
+        self.challenge_status_errors: list[int] = []
         self.challenge_url = f"{PORTAL}/challenge?code=ticket"
         self.optional_challenge = False
         self.token_requests: list[dict] = []
@@ -70,6 +72,8 @@ class FakePortal:
             return httpx.Response(201, json={"user_id": f"nas_user:{self.minted}", "org_id": "nas_org:1",
                                              "token": f"anon_{self.minted:04d}", "idle_ttl_days": 14})
         if path == "/api/anonymous/challenge/status":
+            if self.challenge_status_errors:
+                return httpx.Response(self.challenge_status_errors.pop(0), json={"error": "blip"})
             if self.challenge_statuses:
                 return httpx.Response(200, json={"status": self.challenge_statuses.pop(0)})
             if self.challenge_never_clears:

@@ -1178,7 +1178,10 @@ def _compute_nous_auth_status() -> Dict[str, Any]:
     base_status = _nous_status_from_state(
         state, logged_in=bool(state.get("access_token")), source="auth_store")
     try:
-        creds = resolve_nous_runtime_credentials()
+        # A status paint must not park on (or open a browser for) a free-tier challenge.
+        from hermes_cli.anon_challenge import background_caller
+        with background_caller():
+            creds = resolve_nous_runtime_credentials()
         refreshed_state = get_provider_auth_state("nous") or state
         base_status.update({
             "logged_in": True,

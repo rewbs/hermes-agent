@@ -283,7 +283,7 @@ _NAS_REFUSALS: Dict[tuple, tuple] = {
     (403, "account_locked"): (AnonCredentialDead, ANON_ACCOUNT_LOCKED),
     (403, "anonymous_accounts_disabled"): (AuthError, ANON_GATE_PAUSED),   # pre-launch names
     (403, "circuit_open"): (AuthError, ANON_GATE_PAUSED),
-    (428, "pow_"): (AuthError, ANON_POW_REQUIRED),
+    (428, None): (AuthError, ANON_POW_REQUIRED),
     (429, None): (AuthError, ANON_RATE_LIMITED),
     (503, "temporarily_disabled"): (AuthError, ANON_GATE_PAUSED),
 }
@@ -304,12 +304,16 @@ def _raise_for_anon_status(
         return payload
     if error.startswith("pow_"):
         error = "pow_"  # pow_required / pow_invalid / pow_replayed are one verdict
-    if status == 428 and error == "challenge_required":
-        raise anon_challenge.challenge_error(payload, portal_base_url)
-    if (status == 403 and error in ("signin_required", "access_denied")) or (status == 428 and error != "pow_"):
-        # Refused without an account, or a 428 this version has no primitive for: either way the
-        # honest way forward is a sign-in, in the service's own words when it sent some.
-        raise anon_challenge.signin_required_error(payload.get("message"))
+    # The challenge gate sits on the token exchange only (``portal_base_url`` is passed by it and
+    # nothing else); every other endpoint keeps the table below, unchanged.
+    if portal_base_url:
+        if status == 428 and error == "challenge_required":
+            raise anon_challenge.challenge_error(payload, portal_base_url)
+        if (status == 403 and error in ("signin_required", "access_denied")) or (
+                status == 428 and error != "pow_"):
+            # Refused without an account, or a 428 this version has no primitive for: either way
+            # the honest way forward is a sign-in, in the service's own words when it sent some.
+            raise anon_challenge.signin_required_error(payload.get("message"))
     cls, code = (_NAS_REFUSALS.get((status, error)) or _NAS_REFUSALS.get((status, None))
                  or (AuthError, ANON_SERVER_ERROR))
     if code == ANON_SERVER_ERROR:

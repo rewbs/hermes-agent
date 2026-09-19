@@ -123,6 +123,73 @@ class TestRequiredChallenge:
         assert len(presented) == 1
 
 
+class TestWhoWaits:
+    def test_a_background_caller_announces_and_returns_at_once(self, nas, presented):
+        """A keepalive tick or a status paint has nobody waiting on it: no poll, no parked thread."""
+        from hermes_cli.auth_nous import resolve_nous_runtime_credentials
+        assert anon_auth.is_guest_state(anon_auth.ensure_portal_identity(explicit=True))
+        nas.challenge_required = True
+        nas.challenge_never_clears = True
+        with anon_challenge.background_caller():
+            with pytest.raises(anon_auth.AuthError) as exc:
+                resolve_nous_runtime_credentials()
+        assert exc.value.code == anon_auth.ANON_CHALLENGE_REQUIRED and exc.value.retryable is True
+        assert len(presented) == 1
+        assert "/api/anonymous/challenge/status" not in [p for _, p in nas.calls]
+
+    def test_a_background_caller_never_prints_or_opens_a_browser(self, monkeypatch, capsys):
+        import webbrowser
+        monkeypatch.setattr(webbrowser, "open", lambda _url: pytest.fail("opened a browser in the background"))
+        challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "A quick check.")
+        with anon_challenge.background_caller():
+            anon_challenge.present(challenge)
+        assert capsys.readouterr().err == ""
+
+    def test_the_keepalive_and_the_status_paint_are_background_callers(self, nas, presented):
+        from hermes_cli.auth_nous import _compute_nous_auth_status
+        from hermes_cli.nous_auth_keepalive import refresh_nous_auth_keepalive_once
+        assert anon_auth.is_guest_state(anon_auth.ensure_portal_identity(explicit=True))
+        nas.challenge_required = True
+        nas.challenge_never_clears = True
+        assert refresh_nous_auth_keepalive_once() is False
+        _compute_nous_auth_status()
+        assert "/api/anonymous/challenge/status" not in [p for _, p in nas.calls]
+
+    def test_a_poll_error_is_a_blip_not_a_verdict(self, nas, presented):
+        nas.challenge_required = True
+        nas.challenge_status_errors = [429]              # the "is it already settled?" read
+        nas.challenge_statuses = ["pending"]
+        nas.challenge_status_errors += [500]
+        assert _resolve()["api_key"]
+        assert len(presented) == 1                       # the 429 did not skip presenting
+
+    def test_a_desktop_flag_without_a_gateway_falls_back_to_the_terminal(self, monkeypatch, capsys):
+        """HERMES_DESKTOP is inherited by CLIs the desktop spawns; with no gateway in this process
+        there is nobody to announce to, so the link is printed instead of silently waiting."""
+        import sys
+        import webbrowser
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv("SSH_TTY", "/dev/pts/0")
+        monkeypatch.delitem(sys.modules, "tui_gateway.server", raising=False)
+        monkeypatch.setattr(webbrowser, "open", lambda _url: False)
+        anon_challenge.present(anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "m"))
+        assert f"{PORTAL}/challenge?code=t" in capsys.readouterr().err
+
+
+class TestOtherEndpointsAreUnchanged:
+    def test_a_428_on_sign_up_is_still_the_proof_of_work_verdict(self, nas):
+        nas.create_response = httpx.Response(428, json={"error": "challenge_required", "challenges": []})
+        with pytest.raises(anon_auth.AuthError) as exc:
+            anon_auth.ensure_portal_identity(explicit=True)
+        assert exc.value.code == anon_auth.ANON_POW_REQUIRED
+
+    def test_a_403_on_sign_up_stays_retryable(self, nas):
+        nas.create_response = httpx.Response(403, json={"error": "access_denied"})
+        with pytest.raises(anon_auth.AuthError) as exc:
+            anon_auth.ensure_portal_identity(explicit=True)
+        assert exc.value.code == anon_auth.ANON_SERVER_ERROR and exc.value.retryable is True
+
+
 class TestWhatIsNeverOpened:
     def test_a_challenge_url_off_the_portal_origin_is_refused(self, nas, presented):
         nas.challenge_required = True
@@ -162,6 +229,22 @@ class TestWhatIsNeverOpened:
             _resolve()
         assert exc.value.code == anon_auth.ANON_SIGNIN_REQUIRED and str(exc.value) == "Not from here, sorry."
 
+    def test_network_numbers_are_kept_finite_and_sane(self):
+        def parsed(expires_in):
+            return anon_challenge.parse_browser_challenge(
+                {"challenges": [{"type": "browser", "url": f"{PORTAL}/challenge?code=t",
+                                 "expires_in": expires_in}]}, PORTAL)
+        assert parsed(float("inf")).expires_in == 600
+        assert parsed(10 ** 12).expires_in == 900
+        assert parsed(0).expires_in == 30
+        assert parsed(True).expires_in == 600
+        assert parsed(float("inf")).as_payload()["expires_in"] == 600
+
+    def test_control_characters_never_reach_the_terminal(self):
+        assert anon_challenge.server_message("Check\x1b[2J this") == "Check [2J this"
+        payload = {"challenges": [{"type": "browser", "url": f"{PORTAL}/challenge?code=\x1b]0;x"}]}
+        assert anon_challenge.parse_browser_challenge(payload, PORTAL) is None
+
     def test_server_copy_is_only_used_when_it_looks_like_copy(self):
         assert anon_challenge.server_message("  Two\n lines  ") == "Two lines"
         assert anon_challenge.server_message("x" * 301) == ""
@@ -190,11 +273,24 @@ class TestPresenting:
     def test_the_desktop_backend_announces_and_never_opens_a_browser(self, monkeypatch):
         announced, opened = [], []
         monkeypatch.setenv("HERMES_DESKTOP", "1")
-        monkeypatch.setattr(anon_challenge, "_announce", announced.append)
+        monkeypatch.setattr(anon_challenge, "_announce", lambda c: announced.append(c) or True)
         monkeypatch.setattr(anon_challenge, "_present_in_terminal", opened.append)
         challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=t", True, 600, 2, "m")
         anon_challenge.present(challenge)
         assert announced == [challenge] and opened == []
+
+    def test_a_terminal_opens_one_tab_per_ticket_however_many_attempts_resume_it(self, monkeypatch, capsys):
+        import webbrowser
+        from hermes_cli import auth_device_flow
+        opened = []
+        monkeypatch.setattr(auth_device_flow, "_is_remote_session", lambda: False)
+        monkeypatch.setattr(auth_device_flow, "_can_open_graphical_browser", lambda: True)
+        monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url) or True)
+        challenge = anon_challenge.BrowserChallenge(f"{PORTAL}/challenge?code=once", True, 600, 2, "m")
+        anon_challenge.present(challenge)
+        anon_challenge.present(challenge)
+        assert opened == [challenge.url]
+        assert capsys.readouterr().err.count(challenge.url) == 2     # the link is always shown
 
     def test_a_terminal_prints_the_link_and_skips_the_browser_over_ssh(self, monkeypatch, capsys):
         import webbrowser

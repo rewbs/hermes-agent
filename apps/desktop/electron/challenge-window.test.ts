@@ -24,6 +24,8 @@ function makeSession() {
 function makeHarness() {
   const windows: any[] = []
   const logs: string[] = []
+  // Errors the next loadURL calls reject with, in order.
+  const loadErrors: Error[] = []
   const session = makeSession()
 
   const createWindow = (options: any) => {
@@ -50,8 +52,9 @@ function makeHarness() {
       },
       loadURL(url: string) {
         this.loaded = url
+        const failure = loadErrors.shift()
 
-        return Promise.resolve()
+        return failure ? Promise.reject(failure) : Promise.resolve()
       }
     })
 
@@ -60,18 +63,21 @@ function makeHarness() {
     return win as any
   }
 
+  const clock = { now: 1_000_000 }
+
   const challenges = createChallengeWindows({
     isReady: () => true,
     getSession: () => session as any,
     resolvePortalBaseUrl: () => PORTAL,
     createWindow,
-    rememberLog: message => logs.push(message)
+    rememberLog: message => logs.push(message),
+    now: () => clock.now
   })
 
   const phase = (win: any, fragment: string) =>
     win.webContents.emit('did-navigate-in-page', {}, `${URL_OK}#${fragment}`)
 
-  return { challenges, windows, logs, session, phase }
+  return { challenges, windows, logs, session, phase, clock, loadErrors }
 }
 
 test('only <portal>/challenge URLs are ever loadable', () => {
@@ -213,9 +219,103 @@ test('two asks for the same challenge share one window', async () => {
   phase(windows[0], 'done')
   assert.deepEqual(await Promise.all([first, second]), ['done', 'done'])
 
-  // Settled: the same URL may run again (a retried mint reuses its ticket).
+})
+
+test('a settled challenge does not come back for the same ticket, until the memory lapses', async () => {
+  const { challenges, windows, phase, clock } = makeHarness()
+  const first = challenges.run({ url: URL_OK, required: true })
+
+  phase(windows[0], 'interactive')
+  windows[0].emit('closed')
+  assert.equal(await first, 'closed')
+
+  // The backend is still announcing the ticket; the window the user closed stays closed.
+  assert.equal(await challenges.run({ url: URL_OK, required: true }), 'closed')
+  assert.equal(windows.length, 1)
+
+  clock.now += 11 * 60_000
   void challenges.run({ url: URL_OK, required: true })
   assert.equal(windows.length, 2)
+})
+
+test('a timed-out window may be tried again for the same ticket', async () => {
+  vi.useFakeTimers()
+
+  try {
+    const { challenges, windows } = makeHarness()
+    const first = challenges.run({ url: URL_OK, required: true })
+
+    vi.advanceTimersByTime(91_000)
+    assert.equal(await first, 'timeout')
+    void challenges.run({ url: URL_OK, required: true })
+    assert.equal(windows.length, 2)
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test('a server redirect off the portal is cancelled, and a foreign page cannot signal a phase', async () => {
+  const { challenges, windows } = makeHarness()
+  const outcome = challenges.run({ url: URL_OK, required: true })
+  const [win] = windows
+  const redirect = { preventDefault: vi.fn() }
+
+  win.webContents.emit('will-redirect', redirect, 'https://evil.example/landing')
+  assert.equal(redirect.preventDefault.mock.calls.length, 1)
+
+  // A fragment on a foreign URL is not a phase: the window is not revealed.
+  win.webContents.emit('did-navigate-in-page', {}, 'https://evil.example/x#interactive', true)
+  assert.equal(win.shown, false)
+
+  // A subframe cannot signal either.
+  win.webContents.emit('did-navigate-in-page', {}, `${URL_OK}#interactive`, false)
+  assert.equal(win.shown, false)
+
+  // And a main-frame commit off the portal ends the run.
+  win.webContents.emit('did-navigate', {}, 'https://evil.example/landing', 200)
+  assert.equal(await outcome, 'failed')
+  assert.equal(win.destroyed, true)
+})
+
+test('an HTTP error page ends the run instead of waiting out the deadline', async () => {
+  const { challenges, windows } = makeHarness()
+  const outcome = challenges.run({ url: URL_OK, required: true })
+
+  windows[0].webContents.emit('did-navigate', {}, URL_OK, 503)
+  assert.equal(await outcome, 'failed')
+})
+
+test('a superseded load is not a failed one, but a real load failure is', async () => {
+  const { challenges, windows, phase, loadErrors } = makeHarness()
+
+  loadErrors.push(Object.assign(new Error('ERR_ABORTED'), { errno: -3 }))
+  const superseded = challenges.run({ url: `${URL_OK}&n=1`, required: true })
+
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(windows[0].destroyed, false)
+  phase(windows[0], 'done')
+  assert.equal(await superseded, 'done')
+
+  loadErrors.push(Object.assign(new Error('ERR_NAME_NOT_RESOLVED'), { errno: -105 }))
+  assert.equal(await challenges.run({ url: `${URL_OK}&n=2`, required: true }), 'error')
+})
+
+test('an absurd ticket life cannot overflow the reveal timer', async () => {
+  vi.useFakeTimers()
+
+  try {
+    const { challenges, windows, phase } = makeHarness()
+    const outcome = challenges.run({ url: URL_OK, required: true, expiresIn: 1e12 })
+
+    phase(windows[0], 'interactive')
+    vi.advanceTimersByTime(60_000)
+    // Still open a minute later: a 2^31 overflow would have closed it at once.
+    assert.equal(windows[0].destroyed, false)
+    vi.advanceTimersByTime(15 * 60_000)
+    assert.equal(await outcome, 'timeout')
+  } finally {
+    vi.useRealTimers()
+  }
 })
 
 test('the user closing a revealed window settles the run', async () => {

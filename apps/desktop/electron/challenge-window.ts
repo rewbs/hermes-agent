@@ -22,8 +22,11 @@ import type { BrowserWindow, BrowserWindowConstructorOptions, Session } from 'el
  *
  * The page is remote content, so the window is hardened the way the link-title
  * window is: sandboxed, isolated, its own partition, no popups, no downloads,
- * no permissions, and no navigation off the portal origin. Only
- * `<portal>/challenge…` URLs are ever loaded — the URL arrives from the
+ * no permissions. It is pinned to the portal origin three ways: navigations
+ * and SERVER REDIRECTS off-origin are cancelled, a main-frame commit anywhere
+ * else ends the run, and a phase is only ever read from a portal URL — a
+ * foreign page must never be able to get this window revealed under a Hermes
+ * title. Only `<portal>/challenge…` URLs are ever loaded — the URL arrives from the
  * network by way of the backend and the renderer, and "open this URL" must not
  * become "open any URL".
  */
@@ -59,6 +62,20 @@ const DEFAULT_TICKET_LIFE_MS = 10 * 60_000
 // Long enough to read "You're all set" when the window was revealed.
 const REVEALED_DONE_LINGER_MS = 1_500
 const REVEALED_FAILED_LINGER_MS = 20_000
+// `expiresIn` is network input that becomes a timer: a delay past 2^31 ms
+// overflows setTimeout and fires at once.
+const MIN_TICKET_LIFE_MS = 30_000
+const MAX_TICKET_LIFE_MS = 15 * 60_000
+// Chromium's ERR_ABORTED: the load was superseded (the page navigated while
+// loading), not failed.
+const ERR_ABORTED = -3
+
+// How long a settled challenge URL is remembered. A window the user closed,
+// or a page that already ruled, must not come back for the same ticket just
+// because the backend is still announcing it (tickets live ten minutes).
+const SETTLED_MEMORY_MS = 10 * 60_000
+/** Outcomes after which the same URL is worth another window. */
+const RETRYABLE_OUTCOMES: readonly ChallengeOutcome[] = ['timeout', 'error']
 
 const PHASES: readonly ChallengePhase[] = ['working', 'interactive', 'done', 'failed']
 
@@ -126,11 +143,14 @@ export function createChallengeWindows({
   getSession,
   resolvePortalBaseUrl,
   createWindow,
-  rememberLog
+  rememberLog,
+  now
 }: ChallengeWindowDependencies) {
   // One window per challenge URL: the backend's event and the renderer's
   // status read can both ask for the same one.
   const running = new Map<string, Promise<ChallengeOutcome>>()
+  const settledAt = new Map<string, { outcome: ChallengeOutcome; at: number }>()
+  const clock = now ?? Date.now
 
   function drive(request: ChallengeRequest, session: Session): Promise<ChallengeOutcome> {
     const portalOrigin = new URL(resolvePortalBaseUrl()).origin
@@ -178,8 +198,17 @@ export function createChallengeWindows({
         }
       }
 
+      const onPortal = (url: string) => {
+        try {
+          return new URL(url).origin === portalOrigin
+        } catch {
+          return false
+        }
+      }
+
       const onPhase = (url: string) => {
-        const phase = challengePhase(url)
+        // Only the portal speaks for the challenge.
+        const phase = onPortal(url) ? challengePhase(url) : null
 
         if (settled || phase === null || phase === 'working') {
           return
@@ -196,7 +225,7 @@ export function createChallengeWindows({
 
           if (!revealed && win && !win.isDestroyed()) {
             revealed = true
-            armDeadline(Math.max(HIDDEN_DEADLINE_MS, (request.expiresIn ?? 0) * 1000 || DEFAULT_TICKET_LIFE_MS))
+            armDeadline(ticketLifeMs(request.expiresIn))
             win.show()
             win.focus()
           }
@@ -225,26 +254,43 @@ export function createChallengeWindows({
 
       contents.setAudioMuted(true)
       contents.setWindowOpenHandler(() => ({ action: 'deny' }))
+
       // The page may move within the portal (a fragment, a reload); it may not
-      // take this window anywhere else.
-      contents.on('will-navigate', (event, url) => {
-        try {
-          if (new URL(url).origin === portalOrigin) {
-            return
-          }
-        } catch {
-          // fall through to the refusal
+      // take this window anywhere else — by script (`will-navigate`) or by a
+      // server redirect (`will-redirect`, which `will-navigate` never sees).
+      const stayOnPortal = (event: { preventDefault: () => void }, url: string) => {
+        if (!onPortal(url)) {
+          event.preventDefault()
+        }
+      }
+
+      contents.on('will-navigate', stayOnPortal)
+      contents.on('will-redirect', stayOnPortal)
+      contents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+        if (isMainFrame !== false) {
+          onPhase(url)
+        }
+      })
+      contents.on('did-navigate', (_event, url, httpResponseCode) => {
+        // Belt and braces: a main-frame commit off the portal ends the run,
+        // and an HTTP error page is not going to signal anything.
+        if (!onPortal(url) || (typeof httpResponseCode === 'number' && httpResponseCode >= 400)) {
+          finish('failed')
+
+          return
         }
 
-        event.preventDefault()
+        onPhase(url)
       })
-      contents.on('did-navigate-in-page', (_event, url) => onPhase(url))
-      contents.on('did-navigate', (_event, url) => onPhase(url))
       contents.on('render-process-gone', () => finish('error'))
       win.on('closed', () => finish('closed'))
 
       armDeadline(HIDDEN_DEADLINE_MS)
-      win.loadURL(request.url).catch(() => finish('error'))
+      win.loadURL(request.url).catch((error: { errno?: number }) => {
+        if (error?.errno !== ERR_ABORTED) {
+          finish('error')
+        }
+      })
     })
   }
 
@@ -263,7 +309,25 @@ export function createChallengeWindows({
       return existing
     }
 
-    const outcome = drive(request, session).finally(() => running.delete(request.url))
+    const before = settledAt.get(request.url)
+
+    if (before && clock() - before.at < SETTLED_MEMORY_MS && !RETRYABLE_OUTCOMES.includes(before.outcome)) {
+      return Promise.resolve(before.outcome)
+    }
+
+    const outcome = drive(request, session)
+      .then(result => {
+        settledAt.set(request.url, { outcome: result, at: clock() })
+
+        for (const [url, entry] of settledAt) {
+          if (clock() - entry.at >= SETTLED_MEMORY_MS) {
+            settledAt.delete(url)
+          }
+        }
+
+        return result
+      })
+      .finally(() => running.delete(request.url))
 
     running.set(request.url, outcome)
 
@@ -271,6 +335,12 @@ export function createChallengeWindows({
   }
 
   return { run }
+}
+
+function ticketLifeMs(expiresInSeconds: number | undefined): number {
+  const asked = (expiresInSeconds ?? 0) * 1000 || DEFAULT_TICKET_LIFE_MS
+
+  return Math.min(MAX_TICKET_LIFE_MS, Math.max(MIN_TICKET_LIFE_MS, asked))
 }
 
 /** IPC payloads are untrusted: accept only the documented shape. */
