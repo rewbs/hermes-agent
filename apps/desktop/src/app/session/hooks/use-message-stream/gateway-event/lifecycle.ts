@@ -1,6 +1,7 @@
 import type { GatewayEvent } from '@hermes/shared'
 import type { HermesSkin } from '@hermes/shared/skin'
 
+import { runFreeTierChallenge } from '@/store/free-tier-challenge'
 import {
   notifyCronChanged,
   notifyPairingChanged,
@@ -45,6 +46,16 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
     if (fromActiveSource()) {
       notifySetupReady()
     }
+
+    return true
+  }
+
+  if (event.type === 'free_tier.challenge') {
+    // The account service wants a browser challenge cleared before it mints
+    // the free-tier token. The backend polls for the result on its own; this
+    // only gets the page loaded (hidden). Any source's challenge is worth
+    // running: it is the install's identity, not the focused session's.
+    void runFreeTierChallenge(payload)
 
     return true
   }

@@ -177,6 +177,18 @@ method("diagnostics.share_nous", params=DiagnosticsShareNousParams, result=Diagn
 # ── free tier ─────────────────────────────────────────────────────────────────────────────────
 
 
+class FreeTierChallengePayload(OpenModel):
+    """``hermes_cli/anon_challenge.py::BrowserChallenge.as_payload``: the ``free_tier.challenge``
+    event, and ``free_tier.status``'s ``challenge`` field for a client that connected after it."""
+
+    type: Literal["browser"]
+    url: str
+    # False = the account service is measuring, not enforcing: run it hidden, never reveal it.
+    required: bool
+    expires_in: int
+    message: str
+
+
 class FreeTierStatusResult(Result):
     """``available`` = an identity exists AND the tier is on; whether inference runs on it is
     ``setup.runtime_check.free_tier``'s question."""
@@ -187,6 +199,8 @@ class FreeTierStatusResult(Result):
     notice_pending: bool
     model: str
     label: str
+    # A browser challenge the account service is waiting on (``hermes_cli/anon_challenge.py``).
+    challenge: FreeTierChallengePayload | None = None
 
 
 method("free_tier.status", params=ProfileParams, result=FreeTierStatusResult,

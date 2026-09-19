@@ -689,6 +689,16 @@ export interface FreeTierStatusResult {
   notice_pending: boolean
   model: string
   label: string
+  challenge?: FreeTierChallengePayload | null
+}
+/** ``hermes_cli/anon_challenge.py::BrowserChallenge.as_payload``: the ``free_tier.challenge`` event, and ``free_tier.status``'s ``challenge`` field for a client that connected after it. */
+export interface FreeTierChallengePayload {
+  type: 'browser'
+  url: string
+  required: boolean
+  expires_in: number
+  message: string
+  [key: string]: unknown
 }
 export interface FreeTierProvisionResult {
   has_guest: boolean
@@ -4917,6 +4927,8 @@ export interface BackendGatewayEventMap {
   'cron.changed': ChangeSignalPayload
   /** A session-level failure outside a turn (agent init, model switch, compression, resume). */
   error: ErrorPayload
+  /** The account service wants a browser challenge cleared before the free-tier token exchange (broadcast); the desktop loads ``url`` in a hidden window. */
+  'free_tier.challenge': FreeTierChallengePayload
   /** First frame of a connection: the resolved skin, the change-event capability and the replay epoch. */
   'gateway.ready': GatewayReadyPayload
   /** Apply a named desktop layout preset. */
@@ -5046,6 +5058,7 @@ export const GATEWAY_EVENT_TYPES = [
   'connection.update',
   'cron.changed',
   'error',
+  'free_tier.challenge',
   'gateway.ready',
   'layout.apply',
   'message.complete',

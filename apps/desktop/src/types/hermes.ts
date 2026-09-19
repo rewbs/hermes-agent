@@ -142,6 +142,18 @@ export interface OAuthPollResponse {
 /** Result of the `free_tier.status` RPC. Pull-only: it reads local auth state
  *  and makes no network call, so it is safe to refresh on the ambient status
  *  cadence. */
+/** A browser challenge the account service wants cleared before it mints the
+ *  free-tier token (`hermes_cli/anon_challenge.py`). The backend polls for the
+ *  result itself; the desktop only has to load `url` (hidden). */
+export interface FreeTierChallenge {
+  type: 'browser'
+  url: string
+  /** False = the service is measuring, not enforcing: never reveal the window. */
+  required: boolean
+  expires_in: number
+  message: string
+}
+
 export interface FreeTierStatus {
   /** An identity exists AND the free tier is on: connectors ride on it, and so
    *  does inference when nothing else carries it. Whether inference actually
@@ -162,6 +174,8 @@ export interface FreeTierStatus {
   error_code?: string
   retryable?: boolean
   retry_after?: number
+  /** Present while the backend is waiting on a browser challenge. */
+  challenge?: FreeTierChallenge | null
 }
 
 export interface MemoryProviderOAuthStatus {
