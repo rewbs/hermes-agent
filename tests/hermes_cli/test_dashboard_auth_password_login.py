@@ -414,15 +414,16 @@ class TestRateLimit:
         # Behind Cloudflare + the platform router every request shares one peer
         # (the platform proxy) and X-Forwarded-For ends in platform addresses the
         # dashboard cannot enumerate. The edge's client-IP header is adopted only
-        # when the request carries the edge secret, so two browsers throttle
-        # independently while a caller without the secret stays on the peer bucket.
-        from hermes_cli.dashboard_auth.edge_client_ip import EdgeClientIpMiddleware
+        # when Fly-Client-IP (set by the platform edge, not the caller) is a
+        # Cloudflare address, so two browsers throttle independently while a
+        # caller that reached the platform directly stays on the peer bucket.
+        from hermes_cli.dashboard_auth.edge_client_ip import EdgeClientIpMiddleware, parse_edge_ranges
 
-        secret = "0123456789abcdef0123456789abcdef"
-        app = cast(Any, EdgeClientIpMiddleware(cast(Any, web_server.app), secrets=(secret.encode(),)))
+        app = cast(Any, EdgeClientIpMiddleware(
+            cast(Any, web_server.app), edge_networks=tuple(parse_edge_ranges("cloudflare"))))
         peer = ("fdaa:0:1:a7b::2", 50000)
-        attacker = {"x-nous-edge-auth": secret, "cf-connecting-ip": "198.51.100.7"}
-        victim = {"x-nous-edge-auth": secret, "cf-connecting-ip": "203.0.113.10"}
+        attacker = {"fly-client-ip": "172.71.9.9", "cf-connecting-ip": "198.51.100.7"}
+        victim = {"fly-client-ip": "172.71.9.10", "cf-connecting-ip": "203.0.113.10"}
         client = TestClient(app, base_url=str(gated_app.base_url), client=peer)
         for _ in range(_PW_RATE_MAX_ATTEMPTS):
             resp = client.post(
@@ -442,15 +443,18 @@ class TestRateLimit:
         )
         assert allowed.status_code == 200
 
-        # Without the secret the header is attacker-controlled: it must not open
-        # a fresh bucket per invented address.
+        # A caller that connected to the platform edge itself gets its own address
+        # in Fly-Client-IP, so its CF-Connecting-IP is attacker-controlled and must
+        # not open a fresh bucket per invented address.
         for i in range(_PW_RATE_MAX_ATTEMPTS):
             client.post(
-                "/auth/password-login", headers={"cf-connecting-ip": f"192.0.2.{i}"},
+                "/auth/password-login",
+                headers={"fly-client-ip": "198.51.100.7", "cf-connecting-ip": f"192.0.2.{i}"},
                 json={"provider": "testpw", "username": "admin", "password": "WRONG"},
             )
         spoofed = client.post(
-            "/auth/password-login", headers={"cf-connecting-ip": "192.0.2.250"},
+            "/auth/password-login",
+            headers={"fly-client-ip": "198.51.100.7", "cf-connecting-ip": "192.0.2.250"},
             json={"provider": "testpw", "username": "admin", "password": "hunter2"},
         )
         assert spoofed.status_code == 429
