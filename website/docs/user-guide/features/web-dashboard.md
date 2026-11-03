@@ -1058,6 +1058,30 @@ dashboard:
 ```
 
 Only listed peers may supply `X-Forwarded-Proto` and `X-Forwarded-For`.
+
+#### Behind an authenticated edge (Cloudflare in front of a platform proxy)
+
+When Cloudflare fronts a platform proxy (Fly, a managed load balancer), the
+dashboard's peer is the platform and `X-Forwarded-For` ends in platform
+addresses the dashboard cannot list, so `trusted_proxies` cannot recover the
+browser's address. Cloudflare sends it directly as `CF-Connecting-IP`, but a
+caller that reaches the origin without Cloudflare can type that header. Make
+the edge prove itself instead: a Cloudflare Transform Rule adds a secret header
+to every forwarded request, and the dashboard adopts the client-IP header only
+from requests that carry it. Everything keyed on the client address (the
+password throttle, pending caps, the auth audit log) then sees the browser.
+
+Provisioned by environment, never from `config.yaml`:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HERMES_DASHBOARD_EDGE_AUTH_SECRET` | unset (feature off) | Accepted value(s) of the edge header, comma-separated so two are accepted during a rotation. Values under 32 characters are ignored. |
+| `HERMES_DASHBOARD_EDGE_AUTH_HEADER` | `x-nous-edge-auth` | Header the Transform Rule sets. |
+| `HERMES_DASHBOARD_EDGE_CLIENT_IP_HEADER` | `cf-connecting-ip` | Header holding the browser's address. |
+
+A request with a missing or wrong secret, a repeated header, or an unparseable
+address keeps whatever address uvicorn resolved. Hosted Hermes Cloud agents
+receive these from the portal.
 Hermes always preserves loopback trust and rejects `*`, `0.0.0.0/0`, and
 `::/0`. Trusting a network means every container or machine on that network
 can supply forwarding metadata, so prefer an exact proxy IP or a dedicated

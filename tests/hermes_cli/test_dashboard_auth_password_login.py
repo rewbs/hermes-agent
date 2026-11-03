@@ -408,6 +408,53 @@ class TestRateLimit:
         )
         assert allowed.status_code == 200
 
+    def test_edge_verified_clients_get_their_own_buckets(
+        self: TestRateLimit, gated_app: TestClient,
+    ) -> None:
+        # Behind Cloudflare + the platform router every request shares one peer
+        # (the platform proxy) and X-Forwarded-For ends in platform addresses the
+        # dashboard cannot enumerate. The edge's client-IP header is adopted only
+        # when the request carries the edge secret, so two browsers throttle
+        # independently while a caller without the secret stays on the peer bucket.
+        from hermes_cli.dashboard_auth.edge_client_ip import EdgeClientIpMiddleware
+
+        secret = "0123456789abcdef0123456789abcdef"
+        app = cast(Any, EdgeClientIpMiddleware(cast(Any, web_server.app), secrets=(secret.encode(),)))
+        peer = ("fdaa:0:1:a7b::2", 50000)
+        attacker = {"x-nous-edge-auth": secret, "cf-connecting-ip": "198.51.100.7"}
+        victim = {"x-nous-edge-auth": secret, "cf-connecting-ip": "203.0.113.10"}
+        client = TestClient(app, base_url=str(gated_app.base_url), client=peer)
+        for _ in range(_PW_RATE_MAX_ATTEMPTS):
+            resp = client.post(
+                "/auth/password-login", headers=attacker,
+                json={"provider": "testpw", "username": "admin", "password": "WRONG"},
+            )
+            assert resp.status_code == 401
+        blocked = client.post(
+            "/auth/password-login", headers=attacker,
+            json={"provider": "testpw", "username": "admin", "password": "hunter2"},
+        )
+        assert blocked.status_code == 429
+
+        allowed = client.post(
+            "/auth/password-login", headers=victim,
+            json={"provider": "testpw", "username": "admin", "password": "hunter2"},
+        )
+        assert allowed.status_code == 200
+
+        # Without the secret the header is attacker-controlled: it must not open
+        # a fresh bucket per invented address.
+        for i in range(_PW_RATE_MAX_ATTEMPTS):
+            client.post(
+                "/auth/password-login", headers={"cf-connecting-ip": f"192.0.2.{i}"},
+                json={"provider": "testpw", "username": "admin", "password": "WRONG"},
+            )
+        spoofed = client.post(
+            "/auth/password-login", headers={"cf-connecting-ip": "192.0.2.250"},
+            json={"provider": "testpw", "username": "admin", "password": "hunter2"},
+        )
+        assert spoofed.status_code == 429
+
     def test_distinct_ip_buckets_are_capped(self, monkeypatch):
         _reset_password_rate_limit()
         monkeypatch.setattr(auth_routes, "_PW_RATE_MAX_BUCKETS", 3)

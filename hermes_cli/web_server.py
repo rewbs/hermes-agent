@@ -581,6 +581,17 @@ class _LocalOriginCORSMiddleware(CORSMiddleware):
 # middlewares before CORS can answer, producing 401 instead of 204 + headers.
 app.add_middleware(_LocalOriginCORSMiddleware, allow_methods=["*"], allow_headers=["*"])
 
+# Outermost app middleware: behind Cloudflare + the platform router, adopt the edge's client-IP
+# header once the request proves it came through the edge (HERMES_DASHBOARD_EDGE_AUTH_SECRET), so
+# every rate limit, pending cap and audit line below keys on the browser's address rather than the
+# platform proxy's. Inactive without the secret. Runs inside uvicorn's own proxy-header middleware
+# and overrides whatever that resolved. See dashboard_auth/edge_client_ip.py.
+from hermes_cli.dashboard_auth.edge_client_ip import EdgeClientIpMiddleware, edge_client_ip_options
+
+_edge_client_ip_options = edge_client_ip_options()
+if _edge_client_ip_options is not None:
+    app.add_middleware(EdgeClientIpMiddleware, **_edge_client_ip_options)
+
 
 # Authenticated-route self-test: one in-process request per minute against a
 # cheap DB-touching route, catching "liveness fine but every authed request 500s".
